@@ -113,6 +113,7 @@ export default function NuevaFactura() {
   const [observaciones, setObservaciones] = useState("");
 
   const [guardando, setGuardando] = useState(false);
+  const [descargando, setDescargando] = useState(false);
   const [mensaje, setMensaje] = useState(null);
 
   // Selector de clientes
@@ -120,14 +121,13 @@ export default function NuevaFactura() {
   const [clientesLista, setClientesLista] = useState([]);
   const [busquedaCliente, setBusquedaCliente] = useState("");
 
-  const facturaRef = useRef(null);
+  // Ref al contenedor de ancho fijo A4 que se usa SOLO para exportar
+  const exportRef = useRef(null);
 
   // ---------- CARGA INICIAL ----------
   useEffect(() => {
-    // Cargar emisores disponibles
     emisoresAPI.listar().then((data) => {
       setEmisoresDisponibles(data);
-      // Si es factura nueva, precargar el emisor predeterminado
       if (!id && data.length > 0) {
         const pred = data.find((e) => e.predeterminado) || data[0];
         seleccionarEmisor(pred, true);
@@ -165,8 +165,6 @@ export default function NuevaFactura() {
     // eslint-disable-next-line
   }, [id]);
 
-  // Cuando un emisor se selecciona desde el tab, precarga sus datos.
-  // silencioso=true evita mostrar mensaje al cargar inicial.
   const seleccionarEmisor = (em, silencioso = false) => {
     setEmisor({
       emisorId: em._id,
@@ -182,14 +180,26 @@ export default function NuevaFactura() {
   };
 
   // ---------- CÁLCULOS ----------
+  // Solo los items "con datos" entran en la factura visible y en el PDF.
+  // Un item cuenta si tiene descripción O un precio distinto de 0.
+  const itemsValidos = useMemo(
+    () =>
+      items.filter(
+        (it) =>
+          (it.descripcion && it.descripcion.trim() !== "") ||
+          Number(it.precio) > 0,
+      ),
+    [items],
+  );
+
   const neto = useMemo(
     () =>
-      items.reduce(
+      itemsValidos.reduce(
         (acc, it) =>
           acc + (Number(it.cantidad) || 0) * (Number(it.precio) || 0),
         0,
       ),
-    [items],
+    [itemsValidos],
   );
 
   const impuestosCalculados = useMemo(
@@ -313,7 +323,8 @@ export default function NuevaFactura() {
         ...factura,
         emisor,
         cliente,
-        items: items.map(({ id, ...rest }) => rest),
+        // Guardamos solo los items con datos, no las filas vacías
+        items: itemsValidos.map(({ id, ...rest }) => rest),
         impuestos,
         observaciones,
       };
@@ -336,45 +347,68 @@ export default function NuevaFactura() {
   };
 
   // ---------- DESCARGA PDF/PNG ----------
+  // Captura SIEMPRE desde exportRef, que tiene ancho fijo A4 (794px),
+  // así el resultado es idéntico en móvil y en desktop.
   const descargar = async (formato) => {
-    if (!facturaRef.current) return;
-    const html2canvas = (await import("html2canvas")).default;
-    const canvas = await html2canvas(facturaRef.current, {
-      scale: 2,
-      backgroundColor: "#ffffff",
-      useCORS: true,
-    });
+    if (!exportRef.current) return;
+    setDescargando(true);
+    try {
+      const html2canvas = (await import("html2canvas")).default;
+      const canvas = await html2canvas(exportRef.current, {
+        scale: 2,
+        backgroundColor: "#ffffff",
+        useCORS: true,
+        windowWidth: 794,
+      });
 
-    if (formato === "png") {
-      const link = document.createElement("a");
-      link.download = `${factura.numero || "factura"}.png`;
-      link.href = canvas.toDataURL("image/png");
-      link.click();
-      return;
-    }
+      if (formato === "png") {
+        const link = document.createElement("a");
+        link.download = `${factura.numero || "factura"}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+        return;
+      }
 
-    const { jsPDF } = await import("jspdf");
-    const imgData = canvas.toDataURL("image/png");
-    const pdf = new jsPDF({
-      orientation: "portrait",
-      unit: "mm",
-      format: "a4",
-    });
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    const imgWidth = pageWidth;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-    let heightLeft = imgHeight;
-    let position = 0;
-    pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
-    heightLeft -= pageHeight;
-    while (heightLeft > 0) {
-      position = heightLeft - imgHeight;
-      pdf.addPage();
-      pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
-      heightLeft -= pageHeight;
+      const { jsPDF } = await import("jspdf");
+      const imgData = canvas.toDataURL("image/png");
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "mm",
+        format: "a4",
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+
+      // La imagen ocupa todo el ancho de la página A4
+      const imgWidth = pageWidth;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+
+      if (imgHeight <= pageHeight) {
+        // Entra en una sola página: la centramos verticalmente
+        const offsetY = (pageHeight - imgHeight) / 2;
+        pdf.addImage(imgData, "PNG", 0, offsetY, imgWidth, imgHeight);
+      } else {
+        // No entra: la repartimos en varias páginas A4
+        let heightLeft = imgHeight;
+        let position = 0;
+        pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight;
+        while (heightLeft > 0) {
+          position -= pageHeight;
+          pdf.addPage();
+          pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+          heightLeft -= pageHeight;
+        }
+      }
+
+      pdf.save(`${factura.numero || "factura"}.pdf`);
+    } catch (e) {
+      console.error(e);
+      mostrarMensaje("error", "Error al generar el archivo");
+    } finally {
+      setDescargando(false);
     }
-    pdf.save(`${factura.numero || "factura"}.pdf`);
   };
 
   // ---------- HELPERS DE UI ----------
@@ -384,6 +418,212 @@ export default function NuevaFactura() {
     "block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1";
   const sectionCls =
     "bg-white rounded-xl border border-slate-200 p-5 shadow-sm";
+
+  // ---------- COMPONENTE FACTURA (se usa para preview y para exportar) ----------
+  // modo="export" => estilos pensados para el ancho fijo A4.
+  const FacturaDocumento = ({ modo }) => (
+    <div
+      className="bg-white"
+      style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+    >
+      {/* Header emisor */}
+      <div className="p-8 flex gap-5 items-start">
+        {emisor.logo ? (
+          <img
+            src={emisor.logo}
+            alt="logo"
+            className="w-20 h-20 object-contain flex-shrink-0"
+          />
+        ) : (
+          <div className="w-20 h-20 flex-shrink-0 flex items-center justify-center border-2 border-slate-300 rounded text-slate-300 text-xs text-center">
+            LOGO
+          </div>
+        )}
+        <div className="flex-1">
+          <h1 className="text-2xl font-bold text-slate-900">
+            {emisor.nombre || "Empresa"}
+          </h1>
+          {emisor.subtitulo && (
+            <p className="text-sm text-slate-600 mt-0.5">{emisor.subtitulo}</p>
+          )}
+          {emisor.cuit && (
+            <p className="text-xs text-slate-500 mt-1">
+              CUIT/CUIL: {emisor.cuit}
+            </p>
+          )}
+          {emisor.direccion && (
+            <p className="text-xs text-slate-500">{emisor.direccion}</p>
+          )}
+          <p className="text-xs text-slate-500">
+            {emisor.telefono}
+            {emisor.telefono && emisor.email ? " · " : ""}
+            {emisor.email}
+          </p>
+        </div>
+      </div>
+
+      <div className="border-t border-slate-200 mx-8" />
+
+      {/* Título */}
+      <div className="px-8 pt-6 pb-4 flex justify-between items-start">
+        <div>
+          <h2 className="text-3xl font-bold text-slate-900">
+            {factura.titulo || "FACTURA"}
+          </h2>
+          <p className="text-xs text-slate-500 mt-1">
+            Fecha de emisión:{" "}
+            {factura.fecha
+              ? new Date(factura.fecha).toLocaleDateString("es-AR")
+              : "—"}
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-xl font-bold text-orange-500">{factura.numero}</p>
+          <p className="text-xs text-slate-500 mt-1">
+            Válida por: {factura.validez} días
+          </p>
+        </div>
+      </div>
+
+      {/* Cliente */}
+      <div className="px-8 pb-4">
+        <p className="font-bold text-sm text-slate-900">PARA:</p>
+        <p className="text-sm text-slate-700 mt-1">{cliente.nombre || "—"}</p>
+        {cliente.cuit && (
+          <p className="text-sm text-slate-700">CUIT/DNI: {cliente.cuit}</p>
+        )}
+      </div>
+
+      {/* Tabla items (solo items con datos) */}
+      <div className="px-8 mt-4">
+        <table className="w-full text-sm" style={{ tableLayout: "fixed" }}>
+          <thead>
+            <tr className="bg-orange-500 text-white text-left">
+              <th className="px-3 py-2 font-semibold">Descripción</th>
+              <th
+                className="px-3 py-2 font-semibold text-center"
+                style={{ width: "70px" }}
+              >
+                Cantidad
+              </th>
+              <th
+                className="px-3 py-2 font-semibold text-right"
+                style={{ width: "110px" }}
+              >
+                Precio unit.
+              </th>
+              <th
+                className="px-3 py-2 font-semibold text-right"
+                style={{ width: "110px" }}
+              >
+                Subtotal
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {itemsValidos.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={4}
+                  className="px-3 py-4 text-center text-slate-400 text-sm"
+                >
+                  Sin items cargados
+                </td>
+              </tr>
+            ) : (
+              itemsValidos.map((it) => (
+                <tr key={it.id} className="border-b border-slate-100">
+                  <td className="px-3 py-2 text-slate-700 break-words">
+                    {it.descripcion || "—"}
+                  </td>
+                  <td className="px-3 py-2 text-center text-slate-700">
+                    {it.cantidad}
+                  </td>
+                  <td className="px-3 py-2 text-right text-slate-700">
+                    ${fmt(it.precio)}
+                  </td>
+                  <td className="px-3 py-2 text-right text-slate-700">
+                    $
+                    {fmt((Number(it.cantidad) || 0) * (Number(it.precio) || 0))}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Totales */}
+      <div className="px-8 mt-6">
+        <div className="ml-auto w-full max-w-sm space-y-1.5 text-sm">
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="font-semibold text-slate-700">
+              Importe Neto Gravado:
+            </span>
+            <span className="text-slate-700">${fmt(neto)}</span>
+          </div>
+          {impuestosCalculados.map((i) => (
+            <div
+              key={i.id}
+              className="flex justify-between py-1 border-b border-slate-100"
+            >
+              <span className="font-semibold text-slate-700">{i.label}:</span>
+              <span className="text-slate-700">${fmt(i.monto)}</span>
+            </div>
+          ))}
+          <div className="flex justify-between py-2 mt-1 bg-orange-500 text-white px-3 rounded">
+            <span className="font-bold">Importe Total:</span>
+            <span className="font-bold">${fmt(total)}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* CAE */}
+      {(factura.cae || factura.vtoCae) && (
+        <div className="px-8 mt-6 text-sm">
+          {factura.cae && (
+            <p>
+              <span className="font-bold">CAE N°:</span> {factura.cae}
+            </p>
+          )}
+          {factura.vtoCae && (
+            <p>
+              <span className="font-bold">Vto. de CAE:</span>{" "}
+              {new Date(factura.vtoCae).toLocaleDateString("es-AR")}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Observaciones */}
+      {observaciones && (
+        <div className="px-8 mt-6">
+          <p className="font-bold text-sm text-slate-900">Observaciones:</p>
+          <p className="text-sm text-slate-700 whitespace-pre-wrap mt-1">
+            {observaciones}
+          </p>
+        </div>
+      )}
+
+      {/* Footer */}
+      <div
+        className={`bg-slate-800 text-white px-8 py-5 ${
+          modo === "export" ? "mt-8" : "mt-10"
+        }`}
+      >
+        <p className="font-bold text-sm mb-1">Información de Contacto</p>
+        {emisor.telefono && (
+          <p className="text-xs text-slate-300">Tel: {emisor.telefono}</p>
+        )}
+        {emisor.email && (
+          <p className="text-xs text-slate-300">{emisor.email}</p>
+        )}
+        {emisor.direccion && (
+          <p className="text-xs text-slate-300">{emisor.direccion}</p>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <div className="p-4 md:p-8">
@@ -409,17 +649,19 @@ export default function NuevaFactura() {
             </button>
             <button
               onClick={() => descargar("png")}
-              className="flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-100 transition font-medium text-sm shadow-sm"
+              disabled={descargando}
+              className="flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-100 transition font-medium text-sm shadow-sm disabled:opacity-50"
             >
               <FileImage className="w-4 h-4" />
               PNG
             </button>
             <button
               onClick={() => descargar("pdf")}
-              className="flex items-center gap-2 px-4 py-2.5 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition font-medium text-sm shadow-sm"
+              disabled={descargando}
+              className="flex items-center gap-2 px-4 py-2.5 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition font-medium text-sm shadow-sm disabled:opacity-50"
             >
               <FileText className="w-4 h-4" />
-              PDF
+              {descargando ? "Generando..." : "PDF"}
             </button>
           </div>
         </div>
@@ -502,7 +744,6 @@ export default function NuevaFactura() {
                     })}
                   </div>
 
-                  {/* Detalle editable del emisor seleccionado */}
                   <details className="border-t border-slate-200 pt-3">
                     <summary className="text-xs font-semibold text-slate-600 uppercase tracking-wide cursor-pointer hover:text-slate-900">
                       Ajustar datos para esta factura
@@ -730,6 +971,9 @@ export default function NuevaFactura() {
                   Agregar item
                 </button>
               </div>
+              <p className="text-xs text-slate-500 mb-3">
+                Las filas sin descripción ni precio no aparecen en la factura.
+              </p>
               <div className="space-y-3">
                 {items.map((it) => (
                   <div
@@ -907,202 +1151,42 @@ export default function NuevaFactura() {
               <p className="text-xs text-slate-500 mb-3 text-center font-medium uppercase tracking-wide">
                 Vista previa
               </p>
-              <div
-                ref={facturaRef}
-                className="bg-white shadow-lg"
-                style={{
-                  fontFamily: "Arial, Helvetica, sans-serif",
-                  minHeight: "900px",
-                }}
-              >
-                <div className="p-8 flex gap-5 items-start">
-                  {emisor.logo ? (
-                    <img
-                      src={emisor.logo}
-                      alt="logo"
-                      className="w-20 h-20 object-contain flex-shrink-0"
-                    />
-                  ) : (
-                    <div className="w-20 h-20 flex-shrink-0 flex items-center justify-center border-2 border-slate-300 rounded text-slate-300 text-xs text-center">
-                      LOGO
-                    </div>
-                  )}
-                  <div className="flex-1">
-                    <h1 className="text-2xl font-bold text-slate-900">
-                      {emisor.nombre || "Empresa"}
-                    </h1>
-                    {emisor.subtitulo && (
-                      <p className="text-sm text-slate-600 mt-0.5">
-                        {emisor.subtitulo}
-                      </p>
-                    )}
-                    {emisor.cuit && (
-                      <p className="text-xs text-slate-500 mt-1">
-                        CUIT/CUIL: {emisor.cuit}
-                      </p>
-                    )}
-                    {emisor.direccion && (
-                      <p className="text-xs text-slate-500">
-                        {emisor.direccion}
-                      </p>
-                    )}
-                    <p className="text-xs text-slate-500">
-                      {emisor.telefono}
-                      {emisor.telefono && emisor.email ? " · " : ""}
-                      {emisor.email}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="border-t border-slate-200 mx-8" />
-
-                <div className="px-8 pt-6 pb-4 flex justify-between items-start">
-                  <div>
-                    <h2 className="text-3xl font-bold text-slate-900">
-                      {factura.titulo || "FACTURA"}
-                    </h2>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Fecha de emisión:{" "}
-                      {factura.fecha
-                        ? new Date(factura.fecha).toLocaleDateString("es-AR")
-                        : "—"}
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-xl font-bold text-orange-500">
-                      {factura.numero}
-                    </p>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Válida por: {factura.validez} días
-                    </p>
-                  </div>
-                </div>
-
-                <div className="px-8 pb-4">
-                  <p className="font-bold text-sm text-slate-900">PARA:</p>
-                  <p className="text-sm text-slate-700 mt-1">
-                    {cliente.nombre || "—"}
-                  </p>
-                  {cliente.cuit && (
-                    <p className="text-sm text-slate-700">
-                      CUIT/DNI: {cliente.cuit}
-                    </p>
-                  )}
-                </div>
-
-                <div className="px-8 mt-4">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="bg-orange-500 text-white text-left">
-                        <th className="px-3 py-2 font-semibold">Descripción</th>
-                        <th className="px-3 py-2 font-semibold text-center w-20">
-                          Cantidad
-                        </th>
-                        <th className="px-3 py-2 font-semibold text-right w-28">
-                          Precio unit.
-                        </th>
-                        <th className="px-3 py-2 font-semibold text-right w-28">
-                          Subtotal
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {items.map((it) => (
-                        <tr key={it.id} className="border-b border-slate-100">
-                          <td className="px-3 py-2 text-slate-700">
-                            {it.descripcion || "—"}
-                          </td>
-                          <td className="px-3 py-2 text-center text-slate-700">
-                            {it.cantidad}
-                          </td>
-                          <td className="px-3 py-2 text-right text-slate-700">
-                            ${fmt(it.precio)}
-                          </td>
-                          <td className="px-3 py-2 text-right text-slate-700">
-                            $
-                            {fmt(
-                              (Number(it.cantidad) || 0) *
-                                (Number(it.precio) || 0),
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="px-8 mt-6">
-                  <div className="ml-auto w-full max-w-sm space-y-1.5 text-sm">
-                    <div className="flex justify-between py-1 border-b border-slate-100">
-                      <span className="font-semibold text-slate-700">
-                        Importe Neto Gravado:
-                      </span>
-                      <span className="text-slate-700">${fmt(neto)}</span>
-                    </div>
-                    {impuestosCalculados.map((i) => (
-                      <div
-                        key={i.id}
-                        className="flex justify-between py-1 border-b border-slate-100"
-                      >
-                        <span className="font-semibold text-slate-700">
-                          {i.label}:
-                        </span>
-                        <span className="text-slate-700">${fmt(i.monto)}</span>
-                      </div>
-                    ))}
-                    <div className="flex justify-between py-2 mt-1 bg-orange-500 text-white px-3 rounded">
-                      <span className="font-bold">Importe Total:</span>
-                      <span className="font-bold">${fmt(total)}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {(factura.cae || factura.vtoCae) && (
-                  <div className="px-8 mt-6 text-sm">
-                    {factura.cae && (
-                      <p>
-                        <span className="font-bold">CAE N°:</span> {factura.cae}
-                      </p>
-                    )}
-                    {factura.vtoCae && (
-                      <p>
-                        <span className="font-bold">Vto. de CAE:</span>{" "}
-                        {new Date(factura.vtoCae).toLocaleDateString("es-AR")}
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {observaciones && (
-                  <div className="px-8 mt-6">
-                    <p className="font-bold text-sm text-slate-900">
-                      Observaciones:
-                    </p>
-                    <p className="text-sm text-slate-700 whitespace-pre-wrap mt-1">
-                      {observaciones}
-                    </p>
-                  </div>
-                )}
-
-                <div className="mt-10 bg-slate-800 text-white px-8 py-5">
-                  <p className="font-bold text-sm mb-1">
-                    Información de Contacto
-                  </p>
-                  {emisor.telefono && (
-                    <p className="text-xs text-slate-300">
-                      Tel: {emisor.telefono}
-                    </p>
-                  )}
-                  {emisor.email && (
-                    <p className="text-xs text-slate-300">{emisor.email}</p>
-                  )}
-                  {emisor.direccion && (
-                    <p className="text-xs text-slate-300">{emisor.direccion}</p>
-                  )}
+              {/*
+                El preview se muestra dentro de un contenedor con scroll
+                horizontal en pantallas chicas: la factura mantiene su ancho
+                real (794px) y el usuario puede deslizar para verla completa,
+                sin que la tabla se corte.
+              */}
+              <div className="overflow-x-auto">
+                <div
+                  className="bg-white shadow-lg mx-auto"
+                  style={{ width: "794px" }}
+                >
+                  <FacturaDocumento modo="preview" />
                 </div>
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/*
+        ====== CONTENEDOR OCULTO PARA EXPORTAR ======
+        Tiene ancho fijo A4 (794px) y está fuera de la vista.
+        html2canvas captura SIEMPRE desde acá, así el PDF/PNG sale
+        idéntico tanto en celular como en computadora.
+      */}
+      <div
+        style={{
+          position: "fixed",
+          left: "-10000px",
+          top: 0,
+          width: "794px",
+          background: "#ffffff",
+        }}
+      >
+        <div ref={exportRef} style={{ width: "794px", background: "#ffffff" }}>
+          <FacturaDocumento modo="export" />
         </div>
       </div>
 
